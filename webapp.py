@@ -170,18 +170,24 @@ def analyze_asset(symbol: str, period: int = None) -> dict:
     candle_count = CANDLE_COUNT_BY_PERIOD.get(period, 100)
     provider = get_provider(symbol)
 
-    # Prix actuel
+    # Prix actuel (flux live)
     price_info = provider.get_current_price(symbol)
     bid = price_info["bid"]
     ask = price_info["ask"]
     spread = price_info["spread"]
     mid = round((bid + ask) / 2, 6)
 
-    # Bougies
+    # Bougies historiques + éventuelle bougie live
     candles = provider.get_candles(symbol, period, count=candle_count)
 
-    # Moyennes mobiles
-    closes = [c["close"] for c in candles]
+    # Pour l'analyse technique, on ne garde que les bougies CLÔTURÉES
+    if candles and candles[-1].get("live"):
+        candles_for_analysis = candles[:-1]
+    else:
+        candles_for_analysis = candles
+
+    # Moyennes mobiles et indicateurs calculés uniquement sur les bougies clôturées
+    closes = [c["close"] for c in candles_for_analysis]
     ma_fast, ma_slow = compute_moving_averages(closes)
 
     # Signal
@@ -191,19 +197,19 @@ def analyze_asset(symbol: str, period: int = None) -> dict:
     ma_fast_val = round(float(ma_fast.iloc[-1]), 6) if not ma_fast.iloc[-1] != ma_fast.iloc[-1] else None
     ma_slow_val = round(float(ma_slow.iloc[-1]), 6) if not ma_slow.iloc[-1] != ma_slow.iloc[-1] else None
 
-    # Variation (prix live vs open de la première bougie = variation session)
-    if len(candles) >= 2:
-        first_open = candles[0]["open"]
-        curr_close = candles[-1]["close"]
+    # Variation (dernier close clôturé vs open de la première bougie = variation session)
+    if len(candles_for_analysis) >= 2:
+        first_open = candles_for_analysis[0]["open"]
+        curr_close = candles_for_analysis[-1]["close"]
         change = curr_close - first_open
         change_pct = (change / first_open * 100) if first_open != 0 else 0
     else:
         change = 0
         change_pct = 0
 
-    # High / Low du jour (sur les dernières 100 bougies)
-    day_high = max(c["high"] for c in candles)
-    day_low = min(c["low"] for c in candles)
+    # High / Low du jour (sur les dernières bougies clôturées)
+    day_high = max(c["high"] for c in candles_for_analysis) if candles_for_analysis else 0
+    day_low = min(c["low"] for c in candles_for_analysis) if candles_for_analysis else 0
 
     # RSI simple (14 périodes)
     rsi = _compute_rsi(closes, 14)
@@ -610,6 +616,11 @@ def _run_deep_analysis_internal(symbol: str) -> dict:
 
     provider = get_provider(symbol)
     candles = provider.get_candles(symbol, config.CANDLE_PERIOD, count=100)
+
+    # Ne garder que les bougies clôturées pour l'analyse institutionnelle
+    if candles and candles[-1].get("live"):
+        candles = candles[:-1]
+
     closes = [c["close"] for c in candles]
     highs  = [c["high"]  for c in candles]
     lows   = [c["low"]   for c in candles]
@@ -622,6 +633,10 @@ def _run_deep_analysis_internal(symbol: str) -> dict:
     ma_fast, ma_slow = compute_moving_averages(closes)
     rsi = _compute_rsi(closes, 14)
     mid = closes[-1]
+
+    # Signal de croisement MA basé uniquement sur les bougies clôturées
+    from strategy import detect_crossover, Signal as StrategySignal
+    ma_cross_signal = detect_crossover(ma_fast, ma_slow)
 
     # ─── Outils d'analyse ──────────────────────────────────
     def ema(data, period):
@@ -1156,6 +1171,13 @@ def _run_deep_analysis_internal(symbol: str) -> dict:
     elif price_pos > 0.75:
         _scores["sr_position"] = -0.5  # près de la résistance = favorable vente
 
+    # Alignement avec le signal de croisement de moyennes mobiles
+    _scores["ma_crossover"] = 0
+    if ma_cross_signal == StrategySignal.BUY:
+        _scores["ma_crossover"] = 1
+    elif ma_cross_signal == StrategySignal.SELL:
+        _scores["ma_crossover"] = -1
+
     # Calcul de la confluence totale
     total_score = sum(_scores.values())
     aligned_bull = sum(1 for v in _scores.values() if v > 0)
@@ -1167,7 +1189,8 @@ def _run_deep_analysis_internal(symbol: str) -> dict:
     factor_names = {
         "structure": "Structure", "liquidity": "Liquidité", "fakeout": "Faux Breakout",
         "institutional": "Institutionnel", "momentum": "Momentum",
-        "ma_position": "Moyennes Mobiles", "rsi": "RSI", "sr_position": "Position S/R"
+        "ma_position": "Moyennes Mobiles", "rsi": "RSI", "sr_position": "Position S/R",
+        "ma_crossover": "Croisement MA",
     }
     for k, v in _scores.items():
         if v > 0:
@@ -1220,6 +1243,8 @@ def _run_deep_analysis_internal(symbol: str) -> dict:
     # VERDICT FINAL
     # ═══════════════════════════════════════════════════════
     total_criteria = len(results)
+    # On ne valide un trade que si AU MOINS 4 critères clairs sont alignés
+    # (pour augmenter la précision et filtrer les signaux moyens)
     if bullish_count >= 5:
         verdict = "BUY"
         verdict_text = f"🟢 {bullish_count}/{total_criteria} critères HAUSSIERS → SIGNAL D'ACHAT TRÈS FORT"
@@ -1230,11 +1255,7 @@ def _run_deep_analysis_internal(symbol: str) -> dict:
         verdict_text = f"🟢 {bullish_count}/{total_criteria} critères HAUSSIERS → SIGNAL D'ACHAT FORT"
         verdict_emoji = "🚀"
         confidence = round(bullish_count / total_criteria * 100)
-    elif bullish_count >= 3:
-        verdict = "BUY"
-        verdict_text = f"🟢 {bullish_count}/{total_criteria} critères HAUSSIERS → Signal d'ACHAT"
-        verdict_emoji = "🚀"
-        confidence = round(bullish_count / total_criteria * 100)
+    # Moins de 4 critères haussiers → pas de trade pour plus de précision
     elif bearish_count >= 5:
         verdict = "SELL"
         verdict_text = f"🔴 {bearish_count}/{total_criteria} critères BAISSIERS → SIGNAL DE VENTE TRÈS FORT"
@@ -1243,11 +1264,6 @@ def _run_deep_analysis_internal(symbol: str) -> dict:
     elif bearish_count >= 4:
         verdict = "SELL"
         verdict_text = f"🔴 {bearish_count}/{total_criteria} critères BAISSIERS → SIGNAL DE VENTE FORT"
-        verdict_emoji = "📉"
-        confidence = round(bearish_count / total_criteria * 100)
-    elif bearish_count >= 3:
-        verdict = "SELL"
-        verdict_text = f"🔴 {bearish_count}/{total_criteria} critères BAISSIERS → Signal de VENTE"
         verdict_emoji = "📉"
         confidence = round(bearish_count / total_criteria * 100)
     else:
