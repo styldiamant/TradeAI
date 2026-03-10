@@ -217,7 +217,7 @@ YF_INTERVAL_MAP = {
 _cache = {}
 _cache_lock = threading.Lock()
 CACHE_TTL_PRICE = 2        # secondes – prix courant (temps réel)
-CACHE_TTL_CANDLES = 15     # secondes – bougies historiques (refresh fréquent pour rester à jour)
+CACHE_TTL_CANDLES = 60     # secondes – bougies historiques (stable, pas de jitter)
 
 
 def _cache_get(key: str, ttl: int):
@@ -304,12 +304,17 @@ class LivePriceTicker:
 
     def tick(self) -> float:
         """
-        Retourne le dernier prix réel de l'API, sans micro-mouvements artificiels.
+        Retourne un prix "live" basé directement sur le prix API.
+        On ne rajoute plus de bruit aléatoire pour éviter
+        des micro-variations qui ne correspondent pas au
+        prix réel observé sur le marché/chez le broker.
         """
         with self._lock:
             if self._base_price == 0:
                 return 0.0
-
+            # Utiliser directement le prix API comme prix courant
+            # (il est mis à jour toutes les API_REFRESH secondes
+            # dans RealDataProvider via _fetch_api_price).
             self._current_price = self._base_price
 
             # Enregistrer pour la bougie live (garder 30 ticks max)
@@ -605,15 +610,8 @@ class RealDataProvider:
                 _cache_set(cache_key, candles)
             cached = candles or []
 
-        # Synchroniser le LivePriceTicker avec le dernier close réel des bougies
-        # pour éviter tout décalage entre le prix affiché et le graphique
-        ticker = _get_ticker(symbol)
-        if cached:
-            last_candle_close = cached[-1]["close"]
-            if last_candle_close > 0:
-                ticker.set_base_price(last_candle_close)
-
         # Ajouter ou mettre à jour la bougie live (temps réel)
+        ticker = _get_ticker(symbol)
         live_candle = ticker.get_live_candle(period)
         if live_candle and cached:
             candles = list(cached)  # copie pour ne pas modifier le cache
@@ -726,6 +724,19 @@ class RealDataProvider:
                         "vol": sum(g["vol"] for g in group),
                     })
                 candles = agg
+
+            # Filtrer les sauts de rollover (>15% entre bougies consécutives)
+            if len(candles) > 2:
+                filtered = [candles[-1]]  # garder la dernière bougie
+                for i in range(len(candles) - 2, -1, -1):
+                    ratio = candles[i]["close"] / filtered[-1]["close"] if filtered[-1]["close"] else 1
+                    if 0.85 < ratio < 1.15:
+                        filtered.append(candles[i])
+                    else:
+                        logger.debug("Rollover gap filtré pour %s: %.2f → %.2f",
+                                     symbol, candles[i]["close"], filtered[-1]["close"])
+                filtered.reverse()
+                candles = filtered
 
             # Prendre les N dernières bougies
             candles = candles[-count:]
