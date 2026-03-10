@@ -131,18 +131,17 @@ def get_provider(symbol: str):
         if _use_real_data:
             provider = RealDataProvider(symbol=symbol)
             provider.connect()
-            # Test rapide : vérifier si on obtient un prix
+            # Test rapide : essayer de récupérer un prix
             try:
                 p = provider.get_current_price(symbol)
                 if p["bid"] == 0 and p["ask"] == 0:
-                    raise ValueError("Prix nul")
-                _providers[symbol] = provider
-                logger.info("✅ %s → Données RÉELLES", symbol)
+                    logger.warning("⚠️  %s → Prix réel indisponible pour le moment (bid/ask nuls)", symbol)
+                else:
+                    logger.info("✅ %s → Données RÉELLES", symbol)
             except Exception as e:
-                logger.warning("⚠️  %s → Fallback simulateur (%s)", symbol, e)
-                sim = MarketSimulator(symbol=symbol)
-                sim.connect()
-                _providers[symbol] = sim
+                # On garde quand même RealDataProvider pour réessayer aux appels suivants
+                logger.warning("⚠️  %s → Erreur données réelles (on reste sur RealDataProvider) : %s", symbol, e)
+            _providers[symbol] = provider
         else:
             sim = MarketSimulator(symbol=symbol)
             sim.connect()
@@ -171,23 +170,15 @@ def analyze_asset(symbol: str, period: int = None) -> dict:
     candle_count = CANDLE_COUNT_BY_PERIOD.get(period, 100)
     provider = get_provider(symbol)
 
-    # Bougies (source de vérité pour les prix)
-    candles = provider.get_candles(symbol, period, count=candle_count)
+    # Prix actuel
+    price_info = provider.get_current_price(symbol)
+    bid = price_info["bid"]
+    ask = price_info["ask"]
+    spread = price_info["spread"]
+    mid = round((bid + ask) / 2, 6)
 
-    # Prix actuel = dernier close des bougies pour cohérence chart ↔ prix affiché
-    # On utilise les bougies comme référence unique pour éviter tout décalage
-    if candles:
-        last_close = candles[-1]["close"]
-        spread = provider._typical_spread(symbol, last_close) if hasattr(provider, '_typical_spread') else last_close * 0.0002
-        bid = round(last_close - spread / 2, 6)
-        ask = round(last_close + spread / 2, 6)
-        mid = round(last_close, 6)
-    else:
-        price_info = provider.get_current_price(symbol)
-        bid = price_info["bid"]
-        ask = price_info["ask"]
-        spread = price_info["spread"]
-        mid = round((bid + ask) / 2, 6)
+    # Bougies
+    candles = provider.get_candles(symbol, period, count=candle_count)
 
     # Moyennes mobiles
     closes = [c["close"] for c in candles]
@@ -245,9 +236,7 @@ def analyze_asset(symbol: str, period: int = None) -> dict:
     for i, c in enumerate(candles):
         # Timestamp Unix en secondes (pour TradingView chart)
         ts_sec = int(c["ctm"] / 1000)
-        dt = datetime.fromtimestamp(ts_sec)
-        # Afficher date+heure (dd/MM HH:MM) pour lisibilité multi-jours
-        t = dt.strftime("%d/%m %H:%M")
+        t = datetime.fromtimestamp(ts_sec).strftime("%H:%M")
         labels.append(t)
         candle_data.append({
             "x": t,
